@@ -1,7 +1,7 @@
 #!/bin/bash
 # Simplified ZFS Backup System
 # Complete bare-metal backup for Proxmox VE on ZFS
-# Version: 1.0 - Simplified Edition
+# Version: 1.1 - Corrected
 
 set -e
 
@@ -46,7 +46,7 @@ cleanup() {
     fi
     
     # Remove temp files
-    rm -f /run/backup-creds-* 2>/dev/null || true
+    rm -f "/run/backup-creds-$$" 2>/dev/null || true
     
     exit $exit_code
 }
@@ -117,7 +117,7 @@ setup_credentials() {
     echo "=== NAS Configuration (optional) ==="
     read -p "Configure NAS backup? (y/n): " setup_nas
     
-    if [ "$setup_nas" = "y" ]; then
+    if [[ "$setup_nas" == "y" || "$setup_nas" == "Y" ]]; then
         read -p "NAS IP [192.168.1.100]: " NAS_IP
         NAS_IP="${NAS_IP:-192.168.1.100}"
         
@@ -142,7 +142,7 @@ check_requirements() {
     
     # Check commands
     for cmd in zfs zpool gpg tar lz4; do
-        if ! command -v $cmd >/dev/null 2>&1; then
+        if ! command -v "$cmd" >/dev/null 2>&1; then
             missing="$missing $cmd"
         fi
     done
@@ -185,81 +185,51 @@ test_nas() {
 mount_nas() {
     mkdir -p "$TEMP_MOUNT"
     
-    # Create credentials file with secure permissions
-    local creds_file="/run/backup-creds-$"
-    touch "$creds_file"
-    chmod 600 "$creds_file"
+    # Create credentials file with a unique name in /run
+    local creds_file="/run/backup-creds-$$"
     
     cat > "$creds_file" << EOF
 username=$NAS_USER
 password=$NAS_PASSWORD
 EOF
+    chmod 600 "$creds_file"
     
     # Mount
     if mount -t cifs "//$NAS_IP/$NAS_SHARE" "$TEMP_MOUNT" \
         -o credentials="$creds_file",uid=0,gid=0 >/dev/null 2>&1; then
-        rm -f "$creds_file"
-        return 0
-    else
-        rm -f "$creds_file"
-        return 1
-    fi
-}
-
-# Mount USB
-# Mount the selected partition
-mount_partition() {
-    local partition_to_mount="$1"
-    
-    mkdir -p "$TEMP_MOUNT"
-    
-    # Directly mount the selected partition, no guessing needed
-    if mount "$partition_to_mount" "$TEMP_MONT" 2>/dev/null; then
         return 0
     else
         return 1
     fi
 }
 
-# List mountable partitions (More Reliable Version)
-list_mountable_partitions() {
+# Lists ALL partitions and lets the user choose.
+list_and_select_partition() {
     local count=1
     local partitions=()
     local selected_partition=""
 
-    info "Searching for available backup partitions..."
-    local root_pool=$(findmnt -n -o SOURCE / | cut -d'/' -f1)
-    if [ -z "$root_pool" ]; then
-        error "Could not determine the root ZFS pool."
-        return 1
-    fi
-    
-    local root_disks=$(zpool list -vPH -o name "$root_pool" 2>/dev/null | tail -n +2 | xargs -n1 lsblk -no pkname 2>/dev/null | sort -u | tr '\n' ' ' || true)
-    
-    echo "Available mountable partitions:"
+    warn "WARNING: Showing ALL partitions. It is your responsibility to NOT select your system disk."
+    info "Your Proxmox system is likely on a 'zfs_member' partition."
+    echo
 
     local display_lines=()
-    # Find all partitions, get name, size, filesystem type, and parent disk
-    while read -r part_name size fstype pkname; do
-        # Skip partitions on the root disk(s) or without a filesystem
-        if [[ " $root_disks " =~ " $pkname " ]] || [ -z "$fstype" ] || [ "$fstype" == "zfs_member" ]; then
-            continue
-        fi
-
-        display_lines+=("$(printf "%s) /dev/%s (%s, %s)" "$count" "$part_name" "$size" "$fstype")")
-        partitions[$count]="/dev/$part_name"
+    # Find all partitions and get their name, size, and filesystem type
+    while read -r part_name size fstype; do
+        # Just create the line for display
+        display_lines+=("$(printf "%s) %s (%s, FSTYPE: %s)" "$count" "$part_name" "$size" "${fstype:-unknown}")")
+        partitions[$count]="$part_name"
         count=$((count + 1))
-    done < <(lsblk -n -p -o NAME,SIZE,FSTYPE,PKNAME | grep -v "─" | sed 's|^/dev/||')
+    done < <(lsblk -n -p -o NAME,SIZE,FSTYPE)
 
     if [ ${#display_lines[@]} -eq 0 ]; then
-        error "No usable backup partitions found."
-        info "Ensure your USB drive is partitioned and formatted (e.g., ext4, exfat)."
+        error "Could not find any partitions. Check if USB drive is connected."
         return 1
     fi
     
     printf '%s\n' "${display_lines[@]}"
     echo
-    read -p "Select partition (1-$((${#partitions[@]}))): " choice
+    read -p "Select partition to mount (1-$((${#partitions[@]}))): " choice
 
     if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#partitions[@]}" ]; then
         selected_partition="${partitions[$choice]}"
@@ -267,6 +237,20 @@ list_mountable_partitions() {
         return 0
     else
         error "Invalid selection."
+        return 1
+    fi
+}
+
+# Mounts the selected partition
+mount_partition() {
+    local partition_to_mount="$1"
+    
+    mkdir -p "$TEMP_MOUNT"
+    
+    # Directly mount the selected partition.
+    if mount "$partition_to_mount" "$TEMP_MOUNT" 2>/dev/null; then
+        return 0
+    else
         return 1
     fi
 }
@@ -318,14 +302,14 @@ create_backup() {
     
     # Show progress
     echo -n "Progress: "
-    while kill -0 $backup_pid 2>/dev/null; do
+    while kill -0 "$backup_pid" 2>/dev/null; do
         echo -n "."
         sleep 5
     done
     echo " done"
     
     # Check if backup succeeded
-    wait $backup_pid
+    wait "$backup_pid"
     if [ $? -eq 0 ] && [ -s "$zfs_file" ]; then
         success "ZFS pool backed up: $(du -h "$zfs_file" | cut -f1)"
     else
@@ -340,7 +324,7 @@ create_backup() {
     # For NAS, ensure data is flushed
     if [ "$target" = "nas" ]; then
         sync
-        sleep 10
+        sleep 5
     fi
     
     # Test decryption
@@ -372,26 +356,9 @@ RESTORE INSTRUCTIONS
 Date: $(date)
 Files: $(basename "$boot_file") + $(basename "$zfs_file")
 
-1. Boot Ubuntu Live USB
-2. Install tools: apt update && apt install -y zfsutils-linux gnupg liblz4-tool
-3. Mount backup location and navigate to files
-4. Partition target disk:
-   sgdisk --zap-all /dev/TARGET
-   sgdisk -n 1:0:+512M -t 1:ef00 /dev/TARGET
-   sgdisk -n 2:0:0 -t 2:bf00 /dev/TARGET
-   mkfs.fat -F32 /dev/TARGET1
-
-5. Restore ZFS:
-   zpool create -f rpool /dev/TARGET2
-   gpg -d zfs-backup-${date}.lz4.gpg | lz4 -d | zfs receive -F rpool
-
-6. Restore boot:
-   mount /dev/TARGET1 /mnt
-   gpg -d boot-partition-${date}.tar.gz.gpg | tar -xzf - -C /mnt
-   umount /mnt
-
-7. Set bootfs: zpool set bootfs=rpool/ROOT/pve-1 rpool
-8. Reboot
+1. Boot Proxmox VE installer USB and select 'Advanced > Rescue Boot'.
+2. Install tools: apt update && apt install -y gnupg liblz4-tool
+3. Mount backup location and run the 'restore.sh' script.
 EOF
     
     # Cleanup snapshot
@@ -443,16 +410,16 @@ backup() {
             BACKUP_TARGET="nas"
             local backup_path="$TEMP_MOUNT/$NAS_PATH"
             ;;
-    2)
-            local partition_to_mount=$(list_mountable_partitions)
+        2)
+            # The list function now handles user selection and returns the choice
+            local partition_to_mount=$(list_and_select_partition)
             if [ -z "$partition_to_mount" ]; then
-                # The function already printed an error, so just exit
                 exit 1
             fi
 
             info "Mounting partition $partition_to_mount..."
             if ! mount_partition "$partition_to_mount"; then
-                error "Failed to mount partition. Check filesystem and permissions."
+                error "Failed to mount partition. Did you install the exfat driver?"
                 exit 1
             fi
             
