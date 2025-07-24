@@ -231,6 +231,7 @@ mount_usb() {
 }
 
 # List USB devices (ZFS-aware Version)
+# List USB devices (ZFS-aware Version)
 list_usb_devices() {
     local count=1
     local devices=()
@@ -245,8 +246,9 @@ list_usb_devices() {
     fi
     
     # Get all physical disk names backing the pool (handles mirrors, etc.)
-    local root_disks=$(zpool list -vPH -o name "$root_pool" | tail -n +2 | xargs -n1 lsblk -no pkname 2>/dev/null | sort -u | tr '\n' ' ')
-    info "Root pool is on disk(s): $root_disks"
+    # The '|| true' handles cases where there are no physical vdevs to parse
+    local root_disks=$(zpool list -vPH -o name "$root_pool" 2>/dev/null | tail -n +2 | xargs -n1 lsblk -no pkname 2>/dev/null | sort -u | tr '\n' ' ' || true)
+    info "Root pool is on disk(s):$root_disks"
 
     echo "Available USB/secondary devices:"
 
