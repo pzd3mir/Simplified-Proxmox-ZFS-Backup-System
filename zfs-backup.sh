@@ -231,45 +231,63 @@ mount_usb() {
 }
 
 # List USB devices
+# List USB devices (Improved Version)
 list_usb_devices() {
     local count=1
     local devices=()
     
-    # Get root device to exclude
-    local root_device=$(df / | tail -1 | awk '{print $1}' | sed 's/[0-9]*$//' | sed 's|/dev/||')
+    # Reliably get the root disk device (e.g., sda, nvme0n1)
+    # findmnt gets the source partition, lsblk gets its parent disk
+    local root_disk=$(lsblk -no pkname "$(findmnt -n -o SOURCE /)")
     
-    echo "Available USB devices:"
+    echo "Available USB/secondary devices:"
     
-    for device in /dev/sd[a-z] /dev/nvme[1-9]n[1-9]; do
-        if [ -b "$device" ]; then
-            local device_name=$(basename "$device")
-            
-            # Skip root device
-            if [ "$device_name" = "$root_device" ]; then
-                continue
-            fi
-            
-            local size=$(lsblk -d -n -o SIZE "$device" 2>/dev/null || echo "?")
-            local model=$(lsblk -d -n -o MODEL "$device" 2>/dev/null || echo "Unknown")
-            
-            echo "$count) $device ($size) - $model"
-            devices[$count]="$device"
-            count=$((count + 1))
+    # Use lsblk to find all devices of type "disk"
+    # Then read each line into variables
+    lsblk -d -n -o NAME,SIZE,MODEL | while read -r device_name size model; do
+        # Skip the root disk
+        if [ "$device_name" = "$root_disk" ]; then
+            continue
         fi
+        
+        # Construct the full device path
+        local device="/dev/${device_name}"
+        
+        echo "$count) $device ($size) - $model"
+        devices[$count]="$device"
+        count=$((count + 1))
     done
     
+    # The while loop runs in a subshell, so we need to pass the result out
+    # This is a common shell scripting challenge. A simple way is to re-prompt after listing.
     if [ $count -eq 1 ]; then
-        error "No USB devices found"
+        error "No secondary disks found to use as a backup target."
         return 1
     fi
     
     echo
     read -p "Select device (1-$((count-1))): " choice
     
-    if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -lt "$count" ]; then
-        echo "${devices[$choice]}"
+    # Re-run the loop to find the selected device, since the array is lost
+    local selected_device=""
+    local current_item=1
+    lsblk -d -n -o NAME | while read -r device_name; do
+        if [ "$device_name" = "$root_disk" ]; then
+            continue
+        fi
+        
+        if [ "$current_item" -eq "$choice" ]; then
+            selected_device="/dev/${device_name}"
+            break
+        fi
+        current_item=$((current_item + 1))
+    done
+
+    if [[ -n "$selected_device" ]]; then
+        echo "$selected_device"
         return 0
     else
+        error "Invalid selection."
         return 1
     fi
 }
