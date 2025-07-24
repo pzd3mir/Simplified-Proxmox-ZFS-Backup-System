@@ -230,60 +230,53 @@ mount_usb() {
     fi
 }
 
-# List USB devices
-# List USB devices (Improved Version)
+# List USB devices (ZFS-aware Version)
 list_usb_devices() {
     local count=1
     local devices=()
-    
-    # Reliably get the root disk device (e.g., sda, nvme0n1)
-    # findmnt gets the source partition, lsblk gets its parent disk
-    local root_disk=$(lsblk -no pkname "$(findmnt -n -o SOURCE /)")
-    
-    echo "Available USB/secondary devices:"
-    
-    # Use lsblk to find all devices of type "disk"
-    # Then read each line into variables
-    lsblk -d -n -o NAME,SIZE,MODEL | while read -r device_name size model; do
-        # Skip the root disk
-        if [ "$device_name" = "$root_disk" ]; then
-            continue
-        fi
-        
-        # Construct the full device path
-        local device="/dev/${device_name}"
-        
-        echo "$count) $device ($size) - $model"
-        devices[$count]="$device"
-        count=$((count + 1))
-    done
-    
-    # The while loop runs in a subshell, so we need to pass the result out
-    # This is a common shell scripting challenge. A simple way is to re-prompt after listing.
-    if [ $count -eq 1 ]; then
-        error "No secondary disks found to use as a backup target."
+    local selected_device=""
+
+    # Reliably get the physical disks used by the root ZFS pool
+    info "Identifying root ZFS pool disks..."
+    local root_pool=$(findmnt -n -o SOURCE / | cut -d'/' -f1)
+    if [ -z "$root_pool" ]; then
+        error "Could not determine the root ZFS pool."
         return 1
     fi
     
-    echo
-    read -p "Select device (1-$((count-1))): " choice
-    
-    # Re-run the loop to find the selected device, since the array is lost
-    local selected_device=""
-    local current_item=1
-    lsblk -d -n -o NAME | while read -r device_name; do
-        if [ "$device_name" = "$root_disk" ]; then
+    # Get all physical disk names backing the pool (handles mirrors, etc.)
+    local root_disks=$(zpool list -vPH -o name "$root_pool" | tail -n +2 | xargs -n1 lsblk -no pkname 2>/dev/null | sort -u | tr '\n' ' ')
+    info "Root pool is on disk(s): $root_disks"
+
+    echo "Available USB/secondary devices:"
+
+    # Use lsblk to find all devices of type "disk"
+    local available_disks=()
+    local display_lines=()
+    while read -r device_name size model; do
+        # Skip the root disk(s)
+        if [[ " $root_disks " =~ " $device_name " ]]; then
             continue
         fi
-        
-        if [ "$current_item" -eq "$choice" ]; then
-            selected_device="/dev/${device_name}"
-            break
-        fi
-        current_item=$((current_item + 1))
-    done
 
-    if [[ -n "$selected_device" ]]; then
+        display_lines+=("$(printf "%s) /dev/%s (%s) - %s" "$count" "$device_name" "$size" "$model")")
+        available_disks[$count]="/dev/$device_name"
+        count=$((count + 1))
+    done < <(lsblk -d -n -o NAME,SIZE,MODEL)
+    
+    if [ ${#display_lines[@]} -eq 0 ]; then
+        error "No secondary disks found to use as a backup target."
+        return 1
+    fi
+
+    # Print all lines at once
+    printf '%s\n' "${display_lines[@]}"
+    
+    echo
+    read -p "Select device (1-$((${#available_disks[@]}))): " choice
+
+    if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#available_disks[@]}" ]; then
+        selected_device="${available_disks[$choice]}"
         echo "$selected_device"
         return 0
     else
