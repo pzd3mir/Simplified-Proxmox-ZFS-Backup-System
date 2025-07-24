@@ -207,79 +207,63 @@ EOF
 }
 
 # Mount USB
-mount_usb() {
-    local device="$1"
-    local partition="${device}1"
-    
-    # Handle NVMe naming
-    if [[ "$device" == *"nvme"* ]]; then
-        partition="${device}p1"
-    fi
-    
-    # Try partition first, then device
-    if [ ! -b "$partition" ]; then
-        partition="$device"
-    fi
+# Mount the selected partition
+mount_partition() {
+    local partition_to_mount="$1"
     
     mkdir -p "$TEMP_MOUNT"
     
-    if mount "$partition" "$TEMP_MOUNT" 2>/dev/null; then
+    # Directly mount the selected partition, no guessing needed
+    if mount "$partition_to_mount" "$TEMP_MONT" 2>/dev/null; then
         return 0
     else
         return 1
     fi
 }
 
-# List USB devices (ZFS-aware Version)
-# List USB devices (ZFS-aware Version)
-list_usb_devices() {
+# List mountable partitions (More Reliable Version)
+list_mountable_partitions() {
     local count=1
-    local devices=()
-    local selected_device=""
+    local partitions=()
+    local selected_partition=""
 
-    # Reliably get the physical disks used by the root ZFS pool
-    info "Identifying root ZFS pool disks..."
+    info "Searching for available backup partitions..."
     local root_pool=$(findmnt -n -o SOURCE / | cut -d'/' -f1)
     if [ -z "$root_pool" ]; then
         error "Could not determine the root ZFS pool."
         return 1
     fi
     
-    # Get all physical disk names backing the pool (handles mirrors, etc.)
-    # The '|| true' handles cases where there are no physical vdevs to parse
     local root_disks=$(zpool list -vPH -o name "$root_pool" 2>/dev/null | tail -n +2 | xargs -n1 lsblk -no pkname 2>/dev/null | sort -u | tr '\n' ' ' || true)
-    info "Root pool is on disk(s):$root_disks"
+    
+    echo "Available mountable partitions:"
 
-    echo "Available USB/secondary devices:"
-
-    # Use lsblk to find all devices of type "disk"
-    local available_disks=()
     local display_lines=()
-    while read -r device_name size model; do
-        # Skip the root disk(s)
-        if [[ " $root_disks " =~ " $device_name " ]]; then
+    # Find all partitions, get name, size, filesystem type, and parent disk
+    while read -r part_name size fstype pkname; do
+        # Skip partitions on the root disk(s) or without a filesystem
+        if [[ " $root_disks " =~ " $pkname " ]] || [ -z "$fstype" ] || [ "$fstype" == "zfs_member" ]; then
             continue
         fi
 
-        display_lines+=("$(printf "%s) /dev/%s (%s) - %s" "$count" "$device_name" "$size" "$model")")
-        available_disks[$count]="/dev/$device_name"
+        display_lines+=("$(printf "%s) /dev/%s (%s, %s)" "$count" "$part_name" "$size" "$fstype")")
+        partitions[$count]="/dev/$part_name"
         count=$((count + 1))
-    done < <(lsblk -d -n -o NAME,SIZE,MODEL)
-    
+    done < <(lsblk -n -p -o NAME,SIZE,FSTYPE,PKNAME | grep -v "─" | sed 's|^/dev/||')
+
     if [ ${#display_lines[@]} -eq 0 ]; then
-        error "No secondary disks found to use as a backup target."
+        error "No usable backup partitions found."
+        info "Ensure your USB drive is partitioned and formatted (e.g., ext4, exfat)."
         return 1
     fi
-
-    # Print all lines at once
-    printf '%s\n' "${display_lines[@]}"
     
+    printf '%s\n' "${display_lines[@]}"
     echo
-    read -p "Select device (1-$((${#available_disks[@]}))): " choice
+    read -p "Select partition (1-$((${#partitions[@]}))): " choice
 
-    if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#available_disks[@]}" ]; then
-        selected_device="${available_disks[$choice]}"
-        echo "$selected_device"
+    if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#partitions[@]}" ]; then
+        selected_partition="${partitions[$choice]}"
+        echo "$selected_partition"
         return 0
     else
         error "Invalid selection."
@@ -459,16 +443,16 @@ backup() {
             BACKUP_TARGET="nas"
             local backup_path="$TEMP_MOUNT/$NAS_PATH"
             ;;
-        2)
-            local usb_device=$(list_usb_devices)
-            if [ -z "$usb_device" ]; then
-                error "No USB device selected"
+    2)
+            local partition_to_mount=$(list_mountable_partitions)
+            if [ -z "$partition_to_mount" ]; then
+                # The function already printed an error, so just exit
                 exit 1
             fi
-            
-            info "Mounting USB device..."
-            if ! mount_usb "$usb_device"; then
-                error "Failed to mount USB device"
+
+            info "Mounting partition $partition_to_mount..."
+            if ! mount_partition "$partition_to_mount"; then
+                error "Failed to mount partition. Check filesystem and permissions."
                 exit 1
             fi
             
